@@ -1,0 +1,226 @@
+name: RDP
+
+on:
+  workflow_dispatch:
+    inputs:
+      exit_node:
+        description: "Advertise this runner as a Tailscale exit node"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    # GitHub-hosted runners are capped at 360 minutes (6 hours).
+    # The original value (3600) is above the cap and is not valid.
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Configure Core RDP Settings
+        run: |
+          # Enable Remote Desktop and disable Network Level Authentication (kept as in the original)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                           -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                           -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                           -Name "SecurityLayer" -Value 0 -Force
+
+          # Remove any existing rule with the same name to avoid duplication
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+
+          # Allow RDP only from the Tailscale address range (100.64.0.0/10), not from the whole internet
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389 remoteip=100.64.0.0/10
+          if ($LASTEXITCODE -ne 0) { Write-Error "Firewall rule creation failed"; exit 1 }
+
+          # Docs: a Windows exit node must not go to sleep. Disable sleep timeouts as a precaution.
+          powercfg /change standby-timeout-ac 0
+          powercfg /change monitor-timeout-ac 0
+
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User with Secure Password
+        env:
+          RDP_PASSWORD_SECRET: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          Add-Type -AssemblyName System.Security
+
+          if (-not [string]::IsNullOrWhiteSpace($env:RDP_PASSWORD_SECRET)) {
+              # Password supplied through the RDP_PASSWORD secret: it is never printed in the log
+              $password = $env:RDP_PASSWORD_SECRET
+              $source = "secret"
+          } else {
+              # Fallback (original behaviour): random password, printed in the log at the end
+              $charSet = @{
+                  Upper   = [char[]](65..90)
+                  Lower   = [char[]](97..122)
+                  Number  = [char[]](48..57)
+                  Special = ([char[]](33..47) + [char[]](58..64) +
+                             [char[]](91..96) + [char[]](123..126))
+              }
+              $rawPassword = @()
+              $rawPassword += $charSet.Upper | Get-Random -Count 4
+              $rawPassword += $charSet.Lower | Get-Random -Count 4
+              $rawPassword += $charSet.Number | Get-Random -Count 4
+              $rawPassword += $charSet.Special | Get-Random -Count 4
+              $password = -join ($rawPassword | Sort-Object { Get-Random })
+              $source = "generated"
+          }
+
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+
+          "RDP_PASS=$password" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "RDP_PASS_SOURCE=$source" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          if (-not (Get-LocalUser -Name "RDP")) {
+              Write-Error "User creation failed"
+              exit 1
+          }
+
+      - name: Install Tailscale
+        run: |
+          # Resolve the current stable MSI name from Tailscale's package index; fall back to the original pinned version
+          $msiName = $null
+          try {
+              $index = Invoke-RestMethod -Uri "https://pkgs.tailscale.com/stable/?mode=json" -TimeoutSec 30
+              $msiName = $index.MSIs.amd64
+          } catch {
+              Write-Warning "Could not read the Tailscale package index: $($_.Exception.Message)"
+          }
+          if ([string]::IsNullOrWhiteSpace($msiName)) {
+              $msiName = "tailscale-setup-1.82.0-amd64.msi"
+              Write-Warning "Falling back to pinned version: $msiName"
+          }
+          Write-Host "Installing $msiName"
+
+          $installerPath = Join-Path $env:TEMP "tailscale.msi"
+          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/$msiName" -OutFile $installerPath
+
+          $proc = Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart", "TS_NOLAUNCH=1" -Wait -PassThru
+          if ($proc.ExitCode -ne 0) { Write-Error "MSI install failed with exit code $($proc.ExitCode)"; exit 1 }
+          Remove-Item $installerPath -Force
+
+          # Wait for the Tailscale service to be running
+          $ready = $false
+          for ($i = 0; $i -lt 30; $i++) {
+              $svc = Get-Service -Name "Tailscale" -ErrorAction SilentlyContinue
+              if ($svc -and $svc.Status -eq "Running") { $ready = $true; break }
+              Start-Sleep -Seconds 2
+          }
+          if (-not $ready) { Write-Error "Tailscale service did not start"; exit 1 }
+
+      - name: Establish Tailscale Connection
+        env:
+          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          ENABLE_EXIT_NODE: ${{ inputs.exit_node }}
+        run: |
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          # --unattended keeps Tailscale running without a logged-in user (recommended by Tailscale for Windows exit nodes)
+          $tsArgs = @("up", "--authkey=$env:TS_AUTHKEY", "--hostname=gh-runner-$env:GITHUB_RUN_ID", "--unattended")
+          if ($env:ENABLE_EXIT_NODE -eq "true") { $tsArgs += "--advertise-exit-node" }
+
+          & $ts @tsArgs
+          if ($LASTEXITCODE -ne 0) { Write-Error "tailscale up failed"; exit 1 }
+
+          # Wait for Tailscale to assign an IPv4 address
+          $tsIP = $null
+          for ($i = 0; $i -lt 12; $i++) {
+              $out = (& $ts ip -4 2>$null | Select-Object -First 1)
+              if ($out -match '^100\.\d+\.\d+\.\d+$') { $tsIP = $out; break }
+              Start-Sleep -Seconds 5
+          }
+          if (-not $tsIP) { Write-Error "Tailscale IP not assigned. Exiting."; exit 1 }
+          "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Verify RDP and Exit Node
+        env:
+          ENABLE_EXIT_NODE: ${{ inputs.exit_node }}
+        run: |
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
+          }
+          Write-Host "TCP connectivity to RDP successful!"
+
+          if ($env:ENABLE_EXIT_NODE -eq "true") {
+              # Non-fatal check: confirm the exit-node routes are advertised in the local preferences.
+              # Approval in the Tailscale admin console cannot be checked from the runner.
+              try {
+                  $prefs = (& $ts debug prefs | Out-String) | ConvertFrom-Json
+                  if ($prefs.AdvertiseRoutes -contains "0.0.0.0/0") {
+                      Write-Host "Exit node routes are advertised (0.0.0.0/0, ::/0)."
+                      Write-Host "If the phone does not list this device, approve it in the admin console (Machines > Edit route settings > Use as exit node) or use autoApprovers."
+                  } else {
+                      Write-Warning "Exit node routes are NOT advertised."
+                  }
+              } catch {
+                  Write-Warning "Could not read Tailscale prefs: $($_.Exception.Message)"
+              }
+          }
+
+      - name: Measure Runner Internet Speed
+        continue-on-error: true
+        run: |
+          # This measures the runner's own internet link. It is the upper bound for what the phone can get through the exit node.
+          try {
+              $ip = Invoke-RestMethod -Uri "https://api.ipify.org" -TimeoutSec 15
+              Write-Host "Runner public IP: $ip"
+          } catch { Write-Warning "Could not read public IP" }
+
+          # Download test: 100 MB from Cloudflare's speed endpoint
+          $file = Join-Path $env:TEMP "speedtest.bin"
+          $sw = [System.Diagnostics.Stopwatch]::StartNew()
+          Invoke-WebRequest -Uri "https://speed.cloudflare.com/__down?bytes=100000000" -OutFile $file -TimeoutSec 120
+          $sw.Stop()
+          $bytes = (Get-Item $file).Length
+          Remove-Item $file -Force
+          $mbps = [math]::Round(($bytes * 8) / $sw.Elapsed.TotalSeconds / 1e6, 1)
+          Write-Host "Download: $mbps Mbps ($([math]::Round($bytes/1MB,1)) MB in $([math]::Round($sw.Elapsed.TotalSeconds,1)) s)"
+
+          # Upload test: 25 MB to Cloudflare's speed endpoint
+          $payload = New-Object byte[] 25000000
+          $sw.Restart()
+          Invoke-WebRequest -Uri "https://speed.cloudflare.com/__up" -Method Post -Body $payload -ContentType "application/octet-stream" -TimeoutSec 120 | Out-Null
+          $sw.Stop()
+          $up = [math]::Round(($payload.Length * 8) / $sw.Elapsed.TotalSeconds / 1e6, 1)
+          Write-Host "Upload: $up Mbps"
+
+      - name: Maintain Connection
+        run: |
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          if ($env:RDP_PASS_SOURCE -eq "generated") {
+              Write-Host "Password: $env:RDP_PASS"
+          } else {
+              Write-Host "Password: (the value of your RDP_PASSWORD secret)"
+          }
+          Write-Host "==================`n"
+
+          # Stay alive for 340 minutes so the job ends cleanly before the 360-minute limit and the cleanup step can run
+          $end = (Get-Date).AddMinutes(340)
+          while ((Get-Date) -lt $end) {
+              Write-Host "[$(Get-Date)] RDP Active - cancel the workflow run to terminate"
+              Start-Sleep -Seconds 300
+          }
+
+      - name: Tailscale Cleanup
+        if: always()
+        run: |
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          if (Test-Path $ts) { & $ts logout }
